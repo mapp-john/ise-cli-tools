@@ -8,10 +8,13 @@ import os,\
         random,\
         getpass,\
         logging,\
-        netmiko
+        netmiko,\
+        traceback
+from datetime import datetime
 from threading import Thread
 import queue as queue
-from ftp_server import *
+from xftpd import ftp_server,\
+                    sftp_server
 
 
 #
@@ -28,9 +31,9 @@ def define_password():
             password = None
     return password
 
-def COMMANDS(counter,device_type,serverList,outputList,FTP_ADDR,FTP_USER,FTP_PASS):
+def COMMANDS(PAN_Dict,serverList,outputList,sftp_mode,FTP_ADDR,FTP_USER,FTP_PASS,FTP_PORT):
     while not serverList.empty():
-        device = deviceList.get_nowait()
+        device = serverList.get_nowait()
         server = device['server']
         username = device['user']
         password = device['Pass']
@@ -40,24 +43,51 @@ def COMMANDS(counter,device_type,serverList,outputList,FTP_ADDR,FTP_USER,FTP_PAS
         try:
 
             # Connection Break
-            counter = len(devices)-deviceList.qsize()
-            print('\n['+str(counter)+'] Connecting to: '+device+'\n')
-            outputList.put('\n['+str(counter)+'] Connecting to: '+device+'\n')
+            counter = len(PAN_Dict)-serverList.qsize()
+            print(f'\n[{counter}] Connecting to: {server}\n')
+            outputList.put(f'\n[{counter}] Connecting to: {server}\n')
             # Connection Handler
             connection = netmiko.ConnectHandler(ip=server, device_type=device_type, username=username, password=password, global_delay_factor=6)
 
             # Enter App Config ISE
             output = connection.send_command('application config ise', expect_string=r'\[0\]Exit')
+            ##TEST PRINT
+            #print(output)
             output = connection.send_command('16', expect_string=r'\[0\]Exit')
             filename = re.search(r'FullReport.*\.csv',output).group()
             output = connection.send_command('0',expect_string=r'\#')
-            output = connection.send_command(f'crypto host_key add host {FTP_ADDR}',expect_string=r'\#')
 
-            #TODO: Add IF Statement for  FTP vs SFTP
-            output = connection.send_command(f'copy disk:/{filename} sftp://{FTP_ADDR}',expect_string=r'Username\:')
-            output = connection.send_command(f'{FTP_USER}',expect_string=r'Password\:')
-            output = connection.send_command(f'{FTP_PASS}',expect_string=r'\#')
-            output = connection.send_command(f'delete disk:/{filename}',expect_string=r'\#')
+            # IF Statement for FTP vs SFTP
+            if sftp_mode:
+                output = connection.send_command(f'crypto host_key add host {FTP_ADDR}',expect_string=r'\#')
+                if not re.search(fr'{FTP_ADDR} RSA .*',output):
+                    print(f'\n!\n!\n[{counter}] SFTP RSA ERROR - {server}\nCrypto Host Key failure\n\n\n!')
+                    outputList.put(f'\n!\n!\n[{counter}] SFTP RSA ERROR - {server}\nCrypto Host Key failure\n\n\n!')
+                    connection.disconnect()
+                    outputList.put(None)
+                    return
+
+                output = connection.send_command(f'copy disk:/{filename} sftp://{FTP_ADDR}/{server}',expect_string=r'Username\:')
+                output = connection.send_command(f'{FTP_USER}',expect_string=r'Password\:')
+                output = connection.send_command(f'{FTP_PASS}',expect_string=r'\#')
+                if output.endswith('failed'):
+                    print(f'\n!\n!\n[{counter}] FILE TRANSFER ERROR - {server}\nFile Transfer failure\n\n\n!')
+                    outputList.put(f'\n!\n!\n[{counter}] FILE TRANSFER ERROR - {server}\nFile Transfer failure\n\n\n!')
+                    connection.disconnect()
+                    outputList.put(None)
+                    return
+                output = connection.send_command(f'delete disk:/{filename}',expect_string=r'\#')
+            else:
+                output = connection.send_command(f'copy disk:/{filename} ftp://{FTP_ADDR}:{FTP_PORT}/{server}',expect_string=r'Username\:')
+                output = connection.send_command(f'{FTP_USER}',expect_string=r'Password\:')
+                output = connection.send_command(f'{FTP_PASS}',expect_string=r'\#')
+                if output.endswith('failed'):
+                    print(f'\n!\n!\n[{counter}] FILE TRANSFER ERROR - {server}\nFile Transfer failure\n\n\n!')
+                    outputList.put(f'\n!\n!\n[{counter}] FILE TRANSFER ERROR - {server}\nFile Transfer failure\n\n\n!')
+                    connection.disconnect()
+                    outputList.put(None)
+                    return
+                output = connection.send_command(f'delete disk:/{filename}',expect_string=r'\#')
 
 
 
@@ -65,17 +95,19 @@ def COMMANDS(counter,device_type,serverList,outputList,FTP_ADDR,FTP_USER,FTP_PAS
 
 
 
-
-            outputList.put(('!\n['+str(counter)+'] PASSWORD CHANGE: PASSWORD CHANGE COMPLETED - '+device+'\n!'))
+            print(f'!\n[{counter}] ENDPOINT REPORT COMPLETED - {server}\n!')
+            outputList.put(f'!\n[{counter}] ENDPOINT REPORT COMPLETED - {server}\n!')
             try:
                 connection.disconnect()
             except OSError:
                 pass
             except:
-                outputList.put(('\n!'+'\n!'+'\n['+str(counter)+'] PASSWORD CHANGE: DISCONNECT ERROR - '+device+'\n!'+'\n!'))
+                print(f'\n!\n!\n[{counter}] DISCONNECT ERROR - {server}\n{traceback.format_exc()}\n\n\n!')
+                outputList.put(f'\n!\n!\n[{counter}] DISCONNECT ERROR - {server}\n{traceback.format_exc()}\n\n\n!')
 
         except:    # exceptions as exceptionOccured:
-            outputList.put(('\n!'+'\n!'+'\n['+str(counter)+'] PASSWORD CHANGE: CONNECTION ERROR - '+device+'\n!'+'\n!'))
+            print(f'\n!\n!\n[{counter}] CONNECTION ERROR - {server}\n{traceback.format_exc()}\n\n\n!')
+            outputList.put(f'\n!\n!\n[{counter}] CONNECTION ERROR - {server}\n{traceback.format_exc()}\n\n\n!')
 
     # Sending None to outputList as to delineate when a device has completed
     outputList.put(None)
@@ -92,53 +124,68 @@ def COMMANDS(counter,device_type,serverList,outputList,FTP_ADDR,FTP_USER,FTP_PAS
 def EndpointReport(server,user,Pass):
     # FTP Mode
     sftp_mode = True
-    while True:
+    ask = True
+    while ask:
         sftp = input('Would you like to use SFTP or FTP to transfer reports? [SFTP/ftp]: ').lower()
-        if sftp in (['sftp','sft','sf','s']):
-            break
+        if sftp in (['sftp','sft','sf','s','']):
+            print('!\nINFO: SFTP Mode will print "EOFError" during client connections; Disregard\n!\n!')
+            ask = False
+            None
         elif sftp in (['ftp','ft','f']):
+            ask = False
             sftp_mode = False
-            break
+
+    Date = datetime.now().strftime('%Y-%m-%d_%H%M')
 
     # ISE PAN Dictionary
-    PAN_Dict = {}
-    PAN_Dict.update({1:{'server':server,'user':user,'Pass':Pass}})
-    count = 1
-    add = True
-    while add:
-        count +=1
-        Add = input('Would You Like To Add Other ISE PANs? [y/N]: ').lower()
-        if Add in (['yes','ye','y']):
-                Test = False
-                while not Test:
-                    # Request FMC server FQDN
-                    serverA = input('Please Enter ISE fqdn: ').lower().strip()
+    build_dict = True
+    while build_dict:
+        PAN_Dict = {}
+        PAN_Dict.update({1:{'server':server,'user':user,'Pass':Pass}})
+        count = 1
+        ask = True
+        while ask:
+            Add = input('Would you like to add additional ISE PANs? [y/N]: ').lower()
+            print('\n')
+            if Add in (['yes','ye','y']):
+                count += 1
+                # Request FMC server FQDN
+                serverA = input('Please Enter ISE fqdn: ').lower().strip()
 
-                    # Validate FQDN
-                    if server[-1] == '/':
-                        server = server[:-1]
-                    if '//' in server:
-                        server = server.split('//')[-1]
+                # Validate FQDN
+                if serverA[-1] == '/':
+                    serverA = serverA[:-1]
+                if '//' in serverA:
+                    serverA = serverA.split('//')[-1]
 
-                    # Perform Test Connection To FQDN
-                    s = socket.socket()
-                    print(f'Attempting to connect to {serverA} on port 22')
-                    try:
-                        s.connect((server, 22))
-                        print(f'Connecton successful to {serverA} on port 22')
-                        s.close()
-                        Test = True
-                        PAN_Dict.update({count:{'server':serverA,'user':user,'Pass':Pass}})
-                        User = input('Do you need to add a different username and password for this PAN? [y/N]: ').lower()
-                        if User in (['yes','ye','y']):
-                            userA = input('Please Enter ISE CLI Username: ').lower().strip()
-                            PassA = define_password()
-                            PAN_Dict[count]['user'] = userA
-                            PAN_Dict[count]['Pass'] = PassA
-                    except Exception:
-                        print(f'Connection to {serverA} on port 22 failed:  {traceback.format_exc()}\n\n')
-        else:
-            add = False
+                # Perform Test Connection To FQDN
+                s = socket.socket()
+                print(f'Attempting to connect to {serverA} on port 22')
+                try:
+                    s.connect((serverA, 22))
+                    print(f'Connecton successful to {serverA} on port 22\n')
+                    s.close()
+                    PAN_Dict.update({count:{'server':serverA,'user':user,'Pass':Pass}})
+                    User = input('Do you need to add a different username and password for this PAN? [y/N]: ').lower()
+                    if User in (['yes','ye','y']):
+                        userA = input('Please Enter ISE CLI Username: ').lower().strip()
+                        PassA = define_password()
+                        PAN_Dict[count]['user'] = userA
+                        PAN_Dict[count]['Pass'] = PassA
+                except Exception:
+                    print(f'Connection to {serverA} on port 22 failed:  {traceback.format_exc()}\n\n')
+            else:
+                ask = False
+        ask = True
+        while ask:
+            rebuild = input('Do you need to re-enter additional PAN details? [y/N]: ').lower()
+            print('\n')
+            if rebuild in (['no','n','']):
+                ask = False
+                build_dict = False
+            elif rebuild in (['yes','ye','y']):
+                ask = False
+
 
 
     # Define Threading Queues
@@ -146,56 +193,48 @@ def EndpointReport(server,user,Pass):
     serverList = queue.Queue()
     outputList = queue.Queue()
 
-    if len(devices) < NUM_THREADS:
-        NUM_THREADS = len(devices)
+    if len(PAN_Dict) < NUM_THREADS:
+        NUM_THREADS = len(PAN_Dict)
     for key,value in PAN_Dict.items():
-        deviceList.put(value)
-
+        serverList.put(value)
 
     # Random Generated Output
-    outputDirectory = ''
-    outputFileName = ''
-    for i in range(6):
-        outputDirectory += chr(random.randint(97,122))
-    outputDirectory += '/'
+    outputDirectory = ''.join(i for i in [chr(random.randint(97,122)) for i in range(6)])
+    outputDirectory = f'{os.getcwd()}/{outputDirectory}/'
     if not os.path.exists(outputDirectory):
         os.makedirs(outputDirectory)
-    for i in range(6):
-        outputFileName += chr(random.randint(97,122))
-    outputFileName += '.txt'
+    # Create Dir for each ISE Node
+    for key,value in PAN_Dict.items():
+        PAN_DIR = f'{outputDirectory}{value["server"]}'
+        if not os.path.exists(PAN_DIR):
+            os.makedirs(PAN_DIR)
+
+    outputFileName = f'{outputDirectory}EndpointReportLogs_{Date}.txt'
 
     # Start FTP Service
-    Dir = os.getcwd()
     try:
         if sftp_mode:
-            SFTP = SftpServer(Dir)
+            SFTP = sftp_server(outputDirectory)
             SFTP.start()
-            FTP_USER = SFTP.user
+            FTP_USER = SFTP.User
             FTP_PASS = SFTP.Pass
             FTP_ADDR = SFTP.Addr
+            FTP_PORT = 22
         else:
-            FTP = FtpServer(Dir)
+            FTP = ftp_server(outputDirectory)
             FTP.start()
-            FTP_USER = FTP.user
+            FTP_USER = FTP.User
             FTP_PASS = FTP.Pass
             FTP_ADDR = FTP.Addr
+            FTP_PORT = FTP.Port
     except:
         print(f'Failed to start SFTP/FTP service:  {traceback.format_exc()}\n\n')
         return
 
-
-    counter = 0
     # loop for devices
     for i in range(NUM_THREADS):
-        Thread(target=COMMANDS, args=(counter,device_type,serverList,outputList,FTP_ADDR,FTP_USER,FTP_PASS)).start()
+        Thread(target=COMMANDS, args=(PAN_Dict,serverList,outputList,sftp_mode,FTP_ADDR,FTP_USER,FTP_PASS,FTP_PORT)).start()
         time.sleep(1)
-
-    # Stop FTP Service
-    if sftp_mode:
-        SFTP.stop()
-    else:
-        FTP = FtpServer(Dir)
-        FTP.stop()
 
     with open(outputFileName,'w') as outputFile:
         numDone = 0
@@ -205,6 +244,12 @@ def EndpointReport(server,user,Pass):
                 numDone += 1
             else:
                 outputFile.write(result)
+
+    # Stop FTP Service
+    if sftp_mode:
+        SFTP.stop()
+    else:
+        FTP.stop()
     return
 
 
@@ -252,7 +297,7 @@ if __name__ == '__main__':
         print(f'Attempting to connect to {server} on port 22')
         try:
             s.connect((server, 22))
-            print(f'Connecton successful to {server} on port 22')
+            print(f'Connecton successful to {server} on port 22\n')
             Test = True
             s.close()
         except Exception:
