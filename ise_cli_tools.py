@@ -149,7 +149,7 @@ def EndpointReport(server,user,Pass):
             print('\n')
             if Add in (['yes','ye','y']):
                 count += 1
-                # Request FMC server FQDN
+                # Request ISE server FQDN
                 serverA = input('Please Enter ISE fqdn: ').lower().strip()
 
                 # Validate FQDN
@@ -283,7 +283,7 @@ if __name__ == '__main__':
 
     Test = False
     while not Test:
-        # Request FMC server FQDN
+        # Request ISE server FQDN
         server = input('Please Enter ISE fqdn: ').lower().strip()
 
         # Validate FQDN
